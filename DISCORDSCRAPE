@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+import requests, json, re, base64, sys, os
+
+class UltimateScanner:
+    def __init__(self, token, flag_format):
+        self.token = token
+        self.flag_format = flag_format  # e.g., "0xfun{", "flag{", "CTF{"
+        self.base = "https://discord.com/api/v9"
+        self.h = {"Authorization": token, "User-Agent": "Mozilla/5.0"}
+        self.data = {}
+        self.flags = []
+        
+        # Build regex pattern from flag format
+        # If user enters "0xfun{", pattern becomes r'0xfun\{[^}]+\}'
+        escaped = re.escape(flag_format)
+        self.flag_pattern = escaped + r'[^}]+\}'
+        print(f"[*] Searching for pattern: {self.flag_pattern}")
+    
+    def req(self, ep):
+        try:
+            r = requests.get(f"{self.base}{ep}", headers=self.h, timeout=5)
+            return r.json() if r.status_code == 200 else None
+        except: return None
+    
+    def download_file(self, url, filename):
+        """Download emoji/sticker files"""
+        try:
+            r = requests.get(url, timeout=5)
+            if r.status_code == 200:
+                with open(filename, 'wb') as f:
+                    f.write(r.content)
+                return r.content
+        except: pass
+        return None
+    
+    def scan_file(self, content, filename):
+        """Scan file content for flags"""
+        flags = []
+        text = content.decode('latin-1', errors='ignore')
+        
+        # Search for flag pattern
+        matches = re.findall(self.flag_pattern, text, re.IGNORECASE)
+        for m in matches:
+            flags.append({'flag': m, 'loc': f"FILE:{filename}", 'ctx': ''})
+        
+        # Extract interesting strings
+        strings = []
+        current = []
+        for byte in content:
+            if 32 <= byte <= 126:
+                current.append(chr(byte))
+            else:
+                if len(current) >= 4:
+                    s = ''.join(current)
+                    if self.flag_format.lower().rstrip('{') in s.lower():
+                        strings.append(s)
+                current = []
+        
+        if strings:
+            print(f"    Interesting strings: {', '.join(strings[:5])}")
+        
+        return flags
+    
+    def find_flags(self, obj, path=""):
+        flags = []
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                flags += self.find_flags(v, f"{path}.{k}")
+        elif isinstance(obj, list):
+            for i, v in enumerate(obj):
+                flags += self.find_flags(v, f"{path}[{i}]")
+        elif isinstance(obj, str):
+            # Search for the custom flag pattern
+            matches = re.findall(self.flag_pattern, obj, re.IGNORECASE)
+            for m in matches:
+                flags.append({'flag': m, 'loc': path, 'ctx': obj[:200]})
+            
+            # Base64 detection
+            if len(obj) > 15 and re.match(r'^[A-Za-z0-9+/]+=*$', obj):
+                try:
+                    d = base64.b64decode(obj).decode()
+                    # Check if decoded content has flag format
+                    if self.flag_format.lower().rstrip('{') in d.lower():
+                        decoded_flags = re.findall(self.flag_pattern, d, re.IGNORECASE)
+                        if decoded_flags:
+                            for df in decoded_flags:
+                                flags.append({'flag': f"BASE64: {df}", 'loc': path, 'ctx': f"Encoded: {obj}"})
+                        else:
+                            # Just show the decoded content if it mentions the flag format
+                            flags.append({'flag': f"BASE64: {d}", 'loc': path, 'ctx': f"Encoded: {obj}"})
+                except: pass
+        return flags
+    
+    def get_guilds(self):
+        g = self.req("/users/@me/guilds")
+        if g:
+            print(f"\n[+] Found {len(g)} servers:\n")
+            for i, x in enumerate(g, 1):
+                print(f"  {i}. {x['name']} (ID: {x['id']})")
+        return g
+    
+    def scan_rules(self, channels, gid):
+        """PRIORITY: Scan rules channel first"""
+        print(f"\n{'='*70}")
+        print("🔒 PRIORITY: SCANNING RULES CHANNEL")
+        print(f"{'='*70}")
+        
+        rules = None
+        for ch in channels:
+            name = ch.get('name', '').lower()
+            if 'rule' in name or '🔒' in ch.get('name', ''):
+                rules = ch
+                break
+        
+        if not rules:
+            print("[-] No rules channel found")
+            return
+        
+        cid = rules['id']
+        cname = rules.get('name')
+        
+        print(f"\n[+] FOUND: {cname} (ID: {cid})")
+        print(f"\n[*] Fetching messages...")
+        
+        msgs = self.req(f"/channels/{cid}/messages?limit=100")
+        if not msgs:
+            print("[-] No messages")
+            return
+        
+        self.data[f'RULES_msgs'] = msgs
+        print(f"[+] {len(msgs)} messages")
+        
+        # Analyze each message and embed
+        for i, msg in enumerate(msgs):
+            author = msg.get('author', {}).get('username', 'Unknown')
+            content = msg.get('content', '')
+            
+            print(f"\n--- Message {i+1} by {author} ---")
+            if content:
+                print(f"Content: {content[:100]}")
+            
+            # Check embeds (CRITICAL!)
+            embeds = msg.get('embeds', [])
+            if embeds:
+                print(f"📌 {len(embeds)} EMBEDS:")
+                for j, embed in enumerate(embeds):
+                    print(f"\n  Embed {j+1}:")
+                    if embed.get('title'):
+                        print(f"    Title: {embed['title']}")
+                    if embed.get('description'):
+                        desc = embed['description']
+                        print(f"    Description: {desc}")
+                    if embed.get('fields'):
+                        for field in embed['fields']:
+                            print(f"    Field [{field.get('name')}]: {field.get('value')}")
+                    if embed.get('footer'):
+                        print(f"    Footer: {embed['footer'].get('text')}")
+                    if embed.get('author'):
+                        print(f"    Author: {embed['author'].get('name')}")
+                    if embed.get('url'):
+                        print(f"    URL: {embed['url']}")
+                    
+                    # Find flags in embed
+                    embed_flags = self.find_flags(embed, f"RULES.msg{i}.embed{j}")
+                    self.flags += embed_flags
+            
+            # Find flags in content
+            self.flags += self.find_flags(msg, f"RULES.msg{i}")
+        
+        # Pinned messages
+        pins = self.req(f"/channels/{cid}/pins")
+        if pins:
+            print(f"\n[+] {len(pins)} pinned messages")
+            self.data[f'RULES_pins'] = pins
+            for pin in pins:
+                self.flags += self.find_flags(pin, "RULES.pinned")
+    
+    def scan(self, gid):
+        print(f"\n{'='*70}\nSCANNING GUILD: {gid}\n{'='*70}")
+        
+        # Guild info
+        print("\n[GUILD]")
+        self.data['guild'] = self.req(f"/guilds/{gid}")
+        if self.data['guild']:
+            print(f"✓ {self.data['guild'].get('name')}")
+            print(f"  Description: {self.data['guild'].get('description', 'None')}")
+        
+        # Get channels first
+        print("\n[CHANNELS]")
+        chs = self.req(f"/guilds/{gid}/channels")
+        if chs:
+            self.data['channels'] = chs
+            print(f"✓ {len(chs)} channels")
+            
+            # SCAN RULES FIRST (PRIORITY!)
+            self.scan_rules(chs, gid)
+        
+        # Roles
+        print(f"\n{'='*70}\n[ROLES]\n{'='*70}")
+        roles = self.req(f"/guilds/{gid}/roles")
+        if roles:
+            self.data['roles'] = roles
+            print(f"✓ {len(roles)} roles")
+            for role in roles:
+                rname = role.get('name')
+                if self.flag_format.lower().rstrip('{') in rname.lower():
+                    print(f"  ⚠️  {rname}")
+        
+        # Custom emojis - DOWNLOAD THEM
+        print(f"\n{'='*70}\n[CUSTOM EMOJIS - DOWNLOADING]\n{'='*70}")
+        emojis = self.req(f"/guilds/{gid}/emojis")
+        if emojis:
+            self.data['emojis'] = emojis
+            print(f"✓ {len(emojis)} custom emojis")
+            
+            os.makedirs('emojis', exist_ok=True)
+            
+            for emoji in emojis:
+                eid = emoji.get('id')
+                ename = emoji.get('name')
+                animated = emoji.get('animated')
+                ext = 'gif' if animated else 'png'
+                url = f"https://cdn.discordapp.com/emojis/{eid}.{ext}"
+                
+                print(f"\n  :{ename}: ({url})")
+                
+                filename = f"emojis/{ename}_{eid}.{ext}"
+                content = self.download_file(url, filename)
+                
+                if content:
+                    print(f"    ✓ Downloaded: {filename} ({len(content)} bytes)")
+                    # Scan the file
+                    file_flags = self.scan_file(content, filename)
+                    self.flags += file_flags
+                else:
+                    print(f"    ✗ Download failed")
+        
+        # Stickers - DOWNLOAD THEM TOO
+        print(f"\n{'='*70}\n[CUSTOM STICKERS - DOWNLOADING]\n{'='*70}")
+        stickers = self.req(f"/guilds/{gid}/stickers")
+        if stickers:
+            self.data['stickers'] = stickers
+            print(f"✓ {len(stickers)} stickers")
+            
+            os.makedirs('stickers', exist_ok=True)
+            
+            for sticker in stickers:
+                sid = sticker.get('id')
+                sname = sticker.get('name')
+                url = f"https://cdn.discordapp.com/stickers/{sid}.png"
+                
+                print(f"\n  {sname} ({url})")
+                
+                filename = f"stickers/{sname}_{sid}.png"
+                content = self.download_file(url, filename)
+                
+                if content:
+                    print(f"    ✓ Downloaded: {filename}")
+                    file_flags = self.scan_file(content, filename)
+                    self.flags += file_flags
+        
+        # Other custom content
+        print(f"\n[SOUNDBOARD]")
+        self.data['soundboard'] = self.req(f"/guilds/{gid}/soundboard-sounds")
+        if self.data['soundboard']:
+            print(f"✓ {len(self.data['soundboard'])} sounds")
+        
+        # Events
+        print(f"\n[EVENTS]")
+        self.data['events'] = self.req(f"/guilds/{gid}/scheduled-events")
+        if self.data['events']:
+            print(f"✓ {len(self.data['events'])} events")
+        
+        self.data['welcome'] = self.req(f"/guilds/{gid}/welcome-screen")
+        self.data['onboarding'] = self.req(f"/guilds/{gid}/onboarding")
+        
+        # Other channel messages (non-rules)
+        print(f"\n{'='*70}\n[OTHER CHANNEL MESSAGES]\n{'='*70}")
+        if chs:
+            for ch in chs:
+                if ch.get('type') != 0: continue
+                cid, cn = ch['id'], ch.get('name')
+                
+                # Skip rules (already scanned)
+                if 'rule' in cn.lower() or '🔒' in cn:
+                    continue
+                
+                msgs = self.req(f"/channels/{cid}/messages?limit=100")
+                if msgs:
+                    self.data[f'msg_{cid}'] = msgs
+                    embeds = sum(len(m.get('embeds',[])) for m in msgs)
+                    print(f"✓ #{cn}: {len(msgs)} msgs, {embeds} embeds")
+                    
+                    # Find flags
+                    for msg in msgs:
+                        self.flags += self.find_flags(msg, f"#{cn}")
+        
+        # Members, webhooks, etc
+        print(f"\n[OTHER DATA]")
+        self.data['members'] = self.req(f"/guilds/{gid}/members?limit=1000")
+        self.data['webhooks'] = self.req(f"/guilds/{gid}/webhooks")
+        self.data['invites'] = self.req(f"/guilds/{gid}/invites")
+        
+        # ANALYZE ALL DATA
+        print(f"\n{'='*70}\nFINAL ANALYSIS\n{'='*70}")
+        
+        for k, v in self.data.items():
+            if v and k not in ['RULES_msgs', 'RULES_pins']:
+                self.flags += self.find_flags(v, k)
+        
+        # Deduplicate
+        u = {}
+        for f in self.flags:
+            if f['flag'] not in u: u[f['flag']] = f
+        
+        print(f"\n{'='*70}")
+        print(f"🚩 FOUND {len(u)} UNIQUE FLAGS")
+        print(f"{'='*70}\n")
+        
+        for i, (flag, info) in enumerate(u.items(), 1):
+            print(f"{i}. {flag}")
+            print(f"   Location: {info['loc']}")
+            if info['ctx'] and len(info['ctx']) < 300:
+                print(f"   Context: {info['ctx']}")
+            print()
+        
+        # Save
+        with open('ultimate_scan.json', 'w') as f:
+            json.dump(self.data, f, indent=2, default=str)
+        
+        print(f"{'='*70}")
+        print("✓ Saved: ultimate_scan.json")
+        print("✓ Emojis: ./emojis/")
+        print("✓ Stickers: ./stickers/")
+        print(f"{'='*70}")
+
+print("="*70)
+print("ULTIMATE DISCORD CTF SCANNER")
+print("="*70)
+
+# Get flag format first
+print("\nWhat is the flag format for this CTF?")
+print("Examples:")
+print("  - XYZfun{")
+print("  - flag{")
+print("  - CTF{")
+print("  - SECRET{")
+flag_format = input("\nEnter flag format (include opening brace): ").strip()
+
+if not flag_format:
+    print("[!] No flag format provided! Using default: flag{")
+    flag_format = "flag{"
+
+if not flag_format.endswith('{'):
+    print(f"[!] Warning: Flag format doesn't end with '{{'. Adding it.")
+    flag_format += '{'
+
+print(f"\n[+] Flag format set to: {flag_format}")
+
+# Get token
+token = sys.argv[1] if len(sys.argv) > 1 else input("\nEnter Discord token: ").strip()
+
+if not token:
+    print("[!] No token provided!")
+    sys.exit(1)
+
+# Create scanner with custom flag format
+s = UltimateScanner(token, flag_format)
+guilds = s.get_guilds()
+
+if guilds:
+    n = int(input("\nSelect server #: "))
+    s.scan(guilds[n-1]['id'])
